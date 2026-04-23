@@ -509,8 +509,7 @@ class TorrentEngine:
             "enable_lsd": self.settings.connection.enable_lsd,
             "enable_upnp": self.settings.connection.enable_upnp,
             "enable_natpmp": self.settings.connection.enable_natpmp,
-            "max_connections": self.settings.connection.max_connections,
-            "max_connections_per_torrent": self.settings.connection.max_connections_per_torrent,
+            "connections_limit": self.settings.connection.max_connections,
         }
 
         if self.settings.speed.download_rate_limit > 0:
@@ -547,6 +546,7 @@ class TorrentEngine:
                 "storage_mode": lt.storage_mode_t.storage_mode_sparse,
             }
             handle = self._session.add_torrent(params)
+            self._lt_inject_trackers(handle)
             info_hash = str(handle.info_hash())
 
             with self._lock:
@@ -567,6 +567,7 @@ class TorrentEngine:
             params = lt.parse_magnet_uri(magnet_uri)
             params.save_path = save_path
             handle = self._session.add_torrent(params)
+            self._lt_inject_trackers(handle)
             info_hash = str(handle.info_hash())
 
             with self._lock:
@@ -579,6 +580,24 @@ class TorrentEngine:
         except Exception as e:
             print(f"Error: {e}")
             return None
+
+    def _lt_inject_trackers(self, handle):
+        """Add public trackers from trackers.py to a libtorrent handle."""
+        try:
+            from core.trackers import get_all_trackers
+            # libtorrent 2.x returns tracker dicts, not objects
+            existing = []
+            for t in handle.trackers():
+                url = t["url"] if isinstance(t, dict) else getattr(t, "url", "")
+                existing.append(url)
+            existing_set = set(existing)
+            for url in get_all_trackers(existing):
+                if url not in existing_set:
+                    handle.add_tracker({"url": url, "tier": 1})
+                    existing_set.add(url)
+            handle.force_reannounce()
+        except Exception as e:
+            print(f"[TopoTorrent] Tracker injection: {e}")
 
     # ═══════════════════════════════════════════════════════════════════
     # Common

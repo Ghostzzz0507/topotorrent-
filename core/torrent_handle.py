@@ -220,36 +220,32 @@ class TorrentHandle:
         trackers = []
         try:
             for t in self._handle.trackers():
-                status = "Working"
-                message = ""
-                peers = 0
+                # libtorrent 2.x returns dicts
+                url = t["url"] if isinstance(t, dict) else getattr(t, "url", "")
+                tier = t.get("tier", 0) if isinstance(t, dict) else getattr(t, "tier", 0)
+                fails = t.get("fails", 0) if isinstance(t, dict) else getattr(t, "fails", 0)
+                msg = t.get("message", "") if isinstance(t, dict) else getattr(t, "message", "")
+                sc = t.get("scrape_complete", 0) if isinstance(t, dict) else 0
+                si = t.get("scrape_incomplete", 0) if isinstance(t, dict) else 0
+                verified = t.get("verified", False) if isinstance(t, dict) else getattr(t, "verified", False)
 
-                if t.endpoints:
-                    ep = t.endpoints[0]
-                    if hasattr(ep, 'info_hashes') and ep.info_hashes:
-                        ih = list(ep.info_hashes)
-                        if ih:
-                            a = ih[0]
-                            if a.fails > 0:
-                                status = f"Error (fails: {a.fails})"
-                                message = str(a.message) if hasattr(a, 'message') else ""
-                            elif a.verified:
-                                status = "Working"
-                            peers = a.scrape_complete + a.scrape_incomplete
-                    elif hasattr(ep, 'fails'):
-                        if ep.fails > 0:
-                            status = f"Error (fails: {ep.fails})"
-                        peers = getattr(ep, 'scrape_complete', 0) + getattr(ep, 'scrape_incomplete', 0)
+                peers = sc + si
+                if fails > 0:
+                    status = f"Error ({fails} fails)"
+                elif verified or peers > 0:
+                    status = "Working"
+                else:
+                    status = "Not contacted"
 
                 trackers.append(TorrentTrackerInfo(
-                    url=t.url,
+                    url=url,
                     status=status,
                     peers=peers,
-                    message=message,
-                    tier=t.tier,
+                    message=msg,
+                    tier=tier,
                 ))
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[Trackers] Error: {e}")
         return trackers
 
     def get_speed_history(self) -> List[tuple]:
