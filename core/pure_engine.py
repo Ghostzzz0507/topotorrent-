@@ -549,7 +549,7 @@ class PeerConnection:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Piece Manager
+# Piece Manager (with swarm intelligence + strategy engine)
 # ═══════════════════════════════════════════════════════════════════════
 
 class PieceManager:
@@ -561,6 +561,16 @@ class PieceManager:
         self.in_progress: Dict[int, float] = {}
         self._block_received: Dict[int, set] = {}
         self._lock = threading.Lock()
+
+        # Piece strategy engine
+        try:
+            from core.piece_strategy import PieceStrategyEngine, PieceSelectionStrategy
+            self.strategy_engine = PieceStrategyEngine(
+                num_pieces=meta.num_pieces,
+                strategy=PieceSelectionStrategy.HYBRID,
+            )
+        except Exception:
+            self.strategy_engine = None
 
     @property
     def progress(self) -> float:
@@ -574,14 +584,27 @@ class PieceManager:
     def bytes_downloaded(self) -> int:
         return sum(self.meta.piece_size(i) for i in self.completed_pieces)
 
-    def get_needed_piece(self, peer_has=None) -> Optional[int]:
+    def get_needed_piece(self, peer_has=None, peer_score=0.0) -> Optional[int]:
         with self._lock:
-            cands = [i for i in range(self.num_pieces)
-                     if i not in self.completed_pieces and i not in self.in_progress
+            needed = set(range(self.num_pieces)) - self.completed_pieces
+            in_prog = set(self.in_progress.keys())
+
+            # Use strategy engine if available (rarest-first / hybrid)
+            if self.strategy_engine:
+                piece = self.strategy_engine.select_piece(
+                    needed=needed,
+                    in_progress=in_prog,
+                    peer_has=peer_has,
+                    peer_topology_score=peer_score,
+                )
+                if piece is not None:
+                    return piece
+
+            # Fallback: original logic
+            cands = [i for i in needed
+                     if i not in in_prog
                      and (peer_has is None or peer_has(i))]
             if cands:
-                # Pick randomly from first 20% of candidates for some variety
-                # This prevents all peers from requesting the same piece
                 if len(cands) > 10:
                     return random.choice(cands[:max(5, len(cands) // 5)])
                 return random.choice(cands)
@@ -681,13 +704,15 @@ class PieceManager:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Peer Worker (with upload support)
+# Peer Worker (with upload, reputation, AI bandwidth, edge cache)
 # ═══════════════════════════════════════════════════════════════════════
 
 class PeerWorker(threading.Thread):
-    PIPELINE = 50  # Extreme pipelining to saturate high-bandwidth connections
+    PIPELINE = 50  # Default pipelining depth
 
-    def __init__(self, peer, pm, meta, save_path, completed_pieces_ref=None):
+    def __init__(self, peer, pm, meta, save_path, completed_pieces_ref=None,
+                 reputation_mgr=None, ai_allocator=None, edge_cache=None,
+                 topology_score=0.0):
         super().__init__(daemon=True, name=f"PW-{peer.ip}:{peer.port}")
         self.peer = peer
         self.pm = pm
@@ -699,6 +724,11 @@ class PeerWorker(threading.Thread):
         self._requested = set()
         self._completed_ref = completed_pieces_ref  # shared set of completed pieces
         self._have_announced = set()  # pieces we've told this peer about
+        self._reputation_mgr = reputation_mgr
+        self._ai_allocator = ai_allocator
+        self._edge_cache = edge_cache
+        self._topology_score = topology_score
+        self._connect_time = time.time()
 
     def stop(self): self._running = False
 
@@ -716,6 +746,22 @@ class PeerWorker(threading.Thread):
             while self._running and p.connected:
                 # Announce any new completed pieces
                 self._announce_new_pieces()
+
+                # Update AI bandwidth allocator with speed data
+                if self._ai_allocator and p.download_speed > 0:
+                    self._ai_allocator.update_peer_speed(
+                        p.ip, p.port, p.download_speed
+                    )
+                    # Dynamic pipeline depth based on AI analysis
+                    self.PIPELINE = self._ai_allocator.get_pipeline_depth(
+                        p.ip, p.port
+                    )
+
+                # Update reputation with speed data
+                if self._reputation_mgr and p.bytes_downloaded > 0:
+                    self._reputation_mgr.record_speed(
+                        p.ip, p.port, p.download_speed
+                    )
 
                 msg = p.receive_message(timeout=5)
                 if msg is None:
@@ -755,13 +801,30 @@ class PeerWorker(threading.Thread):
                         req_begin = struct.unpack("!I", payload[4:8])[0]
                         req_len = struct.unpack("!I", payload[8:12])[0]
                         self._serve_block(req_idx, req_begin, req_len)
+                        # Track upload in reputation
+                        if self._reputation_mgr:
+                            self._reputation_mgr.record_download(
+                                p.ip, p.port, req_len
+                            )
+                        # Track in edge cache for popularity
+                        if self._edge_cache:
+                            self._edge_cache.record_request(
+                                self.meta.info_hash.hex(), req_idx
+                            )
 
                 elif mid == MSG_PIECE and len(payload) >= 8:
                     idx = struct.unpack("!I", payload[:4])[0]
                     begin = struct.unpack("!I", payload[4:8])[0]
                     self._requested.discard(begin)
 
-                    if self.pm.add_block(idx, begin, payload[8:]):
+                    block_data = payload[8:]
+                    # Track upload from peer in reputation
+                    if self._reputation_mgr:
+                        self._reputation_mgr.record_upload(
+                            p.ip, p.port, len(block_data)
+                        )
+
+                    if self.pm.add_block(idx, begin, block_data):
                         # Piece complete and verified!
                         try:
                             self.pm.write_piece(idx, self.save_path, self.meta.files)
@@ -781,14 +844,36 @@ class PeerWorker(threading.Thread):
         except Exception:
             pass
         finally:
+            # Record disconnection in reputation
+            if self._reputation_mgr:
+                duration = time.time() - self._connect_time
+                self._reputation_mgr.record_disconnection(
+                    p.ip, p.port, duration
+                )
             p.disconnect()
 
     def _serve_block(self, piece_idx: int, begin: int, length: int):
-        """Read a block from disk and send it to the peer."""
+        """Read a block from disk (or edge cache) and send it to the peer."""
         try:
-            piece_data = self.pm.read_piece_from_disk(
-                piece_idx, self.save_path, self.meta.files
-            )
+            piece_data = None
+
+            # Try edge cache first (faster)
+            if self._edge_cache:
+                piece_data = self._edge_cache.get(
+                    self.meta.info_hash.hex(), piece_idx
+                )
+
+            # Fall back to disk
+            if piece_data is None:
+                piece_data = self.pm.read_piece_from_disk(
+                    piece_idx, self.save_path, self.meta.files
+                )
+                # Store in edge cache for faster future serving
+                if piece_data and self._edge_cache:
+                    self._edge_cache.put(
+                        self.meta.info_hash.hex(), piece_idx, piece_data
+                    )
+
             if piece_data and begin + length <= len(piece_data):
                 block = piece_data[begin:begin + length]
                 self.peer.send_piece(piece_idx, begin, block)
@@ -816,7 +901,10 @@ class PeerWorker(threading.Thread):
 
     def _pick(self):
         if self.peer.peer_choking: return
-        idx = self.pm.get_needed_piece(peer_has=self.peer.has_piece)
+        idx = self.pm.get_needed_piece(
+            peer_has=self.peer.has_piece,
+            peer_score=self._topology_score,
+        )
         if idx is None: return
         self._cur_piece = idx
         self.pm.mark_in_progress(idx)
@@ -939,11 +1027,56 @@ class PurePythonTorrentHandle:
         self._state = "Queued"
         self._download_speed = 0.0
         self._upload_speed = 0.0
+        self._bottleneck_msg = ""
 
         self._manager_thread: Optional[threading.Thread] = None
         self._listener: Optional[PeerListener] = None
         self._running = False
         self._lock = threading.Lock()
+
+        # === New subsystems ===
+        # Reputation manager (shared across torrents via engine)
+        self._reputation_mgr = None
+        # AI bandwidth allocator
+        self._ai_allocator = None
+        # Edge cache
+        self._edge_cache = None
+        # Geo peer selector
+        self._geo_selector = None
+        # Auto-heal engine
+        self._auto_heal = None
+        # Bottleneck detector
+        self._bottleneck_detector = None
+        # Multi-source engine
+        self._multi_source = None
+
+        # Try to init subsystems
+        self._init_subsystems()
+
+    def _init_subsystems(self):
+        """Initialize all optional subsystems."""
+        try:
+            from core.experimental import AIBandwidthAllocator
+            self._ai_allocator = AIBandwidthAllocator()
+        except Exception:
+            pass
+
+        try:
+            from core.bottleneck import BottleneckDetector
+            self._bottleneck_detector = BottleneckDetector()
+        except Exception:
+            pass
+
+        try:
+            from core.multi_source import MultiSourceEngine
+            if self.meta.total_length > 0:
+                self._multi_source = MultiSourceEngine(
+                    piece_length=self.meta.piece_length,
+                    total_length=self.meta.total_length,
+                    files=self.meta.files,
+                )
+        except Exception:
+            pass
 
     @property
     def is_valid(self): return True
@@ -988,10 +1121,20 @@ class PurePythonTorrentHandle:
 
     def _on_incoming_peer(self, peer: PeerConnection):
         """Called when a new peer connects to us."""
+        # Record in reputation
+        if self._reputation_mgr:
+            self._reputation_mgr.record_connection(peer.ip, peer.port, True)
+
         with self._lock:
             self.all_peers.append(peer)
 
-        worker = PeerWorker(peer, self.piece_manager, self.meta, self.save_path)
+        worker = PeerWorker(
+            peer, self.piece_manager, self.meta, self.save_path,
+            reputation_mgr=self._reputation_mgr,
+            ai_allocator=self._ai_allocator,
+            edge_cache=self._edge_cache,
+            topology_score=self.topology_avg_score,
+        )
         worker.start()
 
         with self._lock:
@@ -1004,13 +1147,16 @@ class PurePythonTorrentHandle:
         if self.piece_manager.is_complete and not self._paused:
             self._state = "Seeding"
         self._download_speed = sum(p.download_speed for p in self.all_peers if p.connected)
+        self._upload_speed = sum(p.upload_speed for p in self.all_peers if p.connected)
         eta = -1
         remaining = self.meta.total_length * (1 - progress)
         if self._download_speed > 0: eta = int(remaining / self._download_speed)
         connected = [p for p in self.all_peers if p.connected]
         num_seeds = len([p for p in connected if p.bitfield and
                         all(p.has_piece(i) for i in range(min(self.meta.num_pieces, 8)))])
-        return {
+
+        # Bottleneck detection
+        status_dict = {
             "name": self.meta.name,
             "total_size": self.meta.total_length,
             "progress": progress,
@@ -1024,7 +1170,7 @@ class PurePythonTorrentHandle:
             "num_complete": num_seeds,
             "num_incomplete": max(0, len(connected) - num_seeds),
             "total_downloaded": self.piece_manager.bytes_downloaded,
-            "total_uploaded": 0,
+            "total_uploaded": sum(p.bytes_uploaded for p in self.all_peers),
             "ratio": 0.0,
             "save_path": self.save_path,
             "info_hash": self.meta.info_hash.hex(),
@@ -1032,7 +1178,34 @@ class PurePythonTorrentHandle:
             "is_paused": self._paused,
             "is_seeding": self.piece_manager.is_complete,
             "topology_score": self.topology_avg_score,
+            "bottleneck": self._bottleneck_msg,
         }
+
+        # Run bottleneck analysis
+        if self._bottleneck_detector and not self.piece_manager.is_complete:
+            try:
+                swarm_health = None
+                if (self.piece_manager.strategy_engine and
+                        self.piece_manager.strategy_engine.swarm):
+                    swarm_health = self.piece_manager.strategy_engine.swarm.get_swarm_health()
+
+                bottlenecks = self._bottleneck_detector.analyze(
+                    status_dict,
+                    peers=self.all_peers,
+                    swarm_health=swarm_health,
+                )
+                self._bottleneck_msg = self._bottleneck_detector.get_primary_message()
+                status_dict["bottleneck"] = self._bottleneck_msg
+            except Exception:
+                pass
+
+        # Calculate ratio
+        total_dl = status_dict["total_downloaded"]
+        total_ul = status_dict["total_uploaded"]
+        if total_dl > 0:
+            status_dict["ratio"] = total_ul / total_dl
+
+        return status_dict
 
     def get_peers(self) -> list:
         from core.torrent_handle import TorrentPeerInfo
@@ -1068,11 +1241,12 @@ class PurePythonTorrentHandle:
         import queue
         MAX_PEERS = 500
         last_announce = 0
+        last_swarm_update = 0
         tried_peers = set()
-        
+
         # Connection worker pool
         peer_queue = queue.Queue()
-        
+
         def connect_worker():
             while self._running:
                 try:
@@ -1080,17 +1254,35 @@ class PurePythonTorrentHandle:
                     if len([p for p in self.all_peers if p.connected]) >= MAX_PEERS:
                         peer_queue.task_done()
                         continue
-                    
+
+                    # Check reputation ban
+                    if self._reputation_mgr and self._reputation_mgr.is_banned(ip, port):
+                        peer_queue.task_done()
+                        continue
+
                     peer = PeerConnection(ip, port, self.meta.info_hash, self.peer_id)
                     if peer.connect(timeout=3):
+                        # Record successful connection
+                        if self._reputation_mgr:
+                            self._reputation_mgr.record_connection(ip, port, True)
+
                         with self._lock:
                             self.all_peers.append(peer)
-                        worker = PeerWorker(peer, self.piece_manager, self.meta, self.save_path)
+                        worker = PeerWorker(
+                            peer, self.piece_manager, self.meta, self.save_path,
+                            reputation_mgr=self._reputation_mgr,
+                            ai_allocator=self._ai_allocator,
+                            edge_cache=self._edge_cache,
+                            topology_score=self.topology_avg_score,
+                        )
                         worker.start()
                         with self._lock:
                             self.peer_workers.append(worker)
                         print(f"[Outgoing] {ip}:{port} ({peer.remote_client})")
                     else:
+                        # Record failed connection
+                        if self._reputation_mgr:
+                            self._reputation_mgr.record_connection(ip, port, False)
                         peer.disconnect()
                     peer_queue.task_done()
                 except queue.Empty:
@@ -1098,9 +1290,13 @@ class PurePythonTorrentHandle:
                 except Exception:
                     pass
 
-        # Start 30 connect workers (acts as a pool to prevent thread explosions)
+        # Start 30 connect workers
         for _ in range(30):
             threading.Thread(target=connect_worker, daemon=True).start()
+
+        # Start multi-source engine if available
+        if self._multi_source:
+            self._multi_source.start()
 
         self._state = "Contacting Trackers"
         threading.Thread(target=self._do_announces, daemon=True).start()
@@ -1115,48 +1311,59 @@ class PurePythonTorrentHandle:
                 last_announce = now
                 threading.Thread(target=self._do_announces, daemon=True).start()
 
+            # Update swarm intelligence periodically
+            if now - last_swarm_update > 5:
+                last_swarm_update = now
+                if (self.piece_manager.strategy_engine and
+                        self.piece_manager.strategy_engine.swarm):
+                    try:
+                        self.piece_manager.strategy_engine.swarm.update_from_peers(
+                            self.all_peers
+                        )
+                    except Exception:
+                        pass
+
+                # Update multi-source speed
+                if self._multi_source:
+                    self._multi_source.update_bt_speed(self._download_speed)
+
             self.all_peers = [p for p in self.all_peers if p.connected]
             self.peer_workers = [w for w in self.peer_workers if w.is_alive()]
             connected = len(self.all_peers)
 
-            # --- Pseudo-PEX (Subnet discovery) ---
-            # For every connected peer, there might be other peers nearby (e.g. ISPs)
-            # Scan nearby IP blocks on common BitTorrent ports to find hidden peers
-            if connected > 0 and connected < MAX_PEERS and peer_queue.qsize() < 100:
-                for p in self.all_peers:
-                    if not p.connected: continue
-                    try:
-                        # Extract subnet A.B.C.*
-                        octets = p.ip.split('.')
-                        if len(octets) == 4:
-                            base_ip = f"{octets[0]}.{octets[1]}.{octets[2]}."
-                            # Add a few nearby IPs to the queue to probe
-                            for offset in [-1, 1, -2, 2]:
-                                last = int(octets[3]) + offset
-                                if 1 <= last <= 254:
-                                    sc_ip = f"{base_ip}{last}"
-                                    if (sc_ip, p.port) not in tried_peers:
-                                        tried_peers.add((sc_ip, p.port))
-                                        peer_queue.put((sc_ip, p.port))
-                                        
-                                    # Also try common BT ports for this specific peer IP
-                                    for sport in [6881, 1337, 6882]:
-                                        if (p.ip, sport) not in tried_peers:
-                                            tried_peers.add((p.ip, sport))
-                                            peer_queue.put((p.ip, sport))
-                    except: pass
-
-            # Feed the connect queue with tracker peers
+            # --- Topology-sorted peer discovery ---
+            # Sort discovered peers by geo score before connecting
             if connected < MAX_PEERS and self.discovered_peers:
                 existing = {(p.ip, p.port) for p in self.all_peers}
-                new = [a for a in self.discovered_peers 
+                new = [a for a in self.discovered_peers
                        if a not in existing and a not in tried_peers]
-                
+
+                # Sort by geo score if geo selector available
+                if self._geo_selector and new:
+                    try:
+                        scored = self._geo_selector.rank_peers(new)
+                        new = [(ip, port) for ip, port, _ in scored]
+                    except Exception:
+                        pass
+
                 # Only feed if queue is getting low
                 if peer_queue.qsize() < 50 and new:
                     for ip, port in new[:100]:
                         tried_peers.add((ip, port))
                         peer_queue.put((ip, port))
+
+            # --- Drop lowest-score peers when at capacity ---
+            if connected >= MAX_PEERS and self._ai_allocator:
+                try:
+                    drop_candidates = self._ai_allocator.get_drop_candidates(3)
+                    for key in drop_candidates:
+                        ip, port_str = key.rsplit(":", 1)
+                        for p in self.all_peers:
+                            if p.ip == ip and str(p.port) == port_str:
+                                p.disconnect()
+                                break
+                except Exception:
+                    pass
 
             if connected > 0:
                 self._state = f"Downloading ({connected} peers)"

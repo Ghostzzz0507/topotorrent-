@@ -1,12 +1,12 @@
 """
 Settings dialog for TopoTorrent.
 
-Multi-tab settings dialog for Connection, Speed, Downloads,
-Topology, and UI preferences.
+Multi-tab settings dialog covering Connection, Speed, Downloads,
+Topology, Privacy, Advanced, and UI preferences.
 """
 
 import tkinter as tk
-from tkinter import filedialog
+from tkinter import filedialog, messagebox
 from typing import Optional
 
 from gui.theme import Colors, Fonts
@@ -32,7 +32,7 @@ class SettingsDialog(tk.Toplevel):
 
         # Center
         self.update_idletasks()
-        w, h = 520, 480
+        w, h = 700, 560
         self.geometry(f"{w}x{h}")
         x = parent.winfo_x() + (parent.winfo_width() - w) // 2
         y = parent.winfo_y() + (parent.winfo_height() - h) // 2
@@ -56,7 +56,7 @@ class SettingsDialog(tk.Toplevel):
             background=Colors.BG_DARK, borderwidth=0)
         style.configure("Settings.TNotebook.Tab",
             background=Colors.BG_LIGHT, foreground=Colors.TEXT_SECONDARY,
-            padding=[14, 4], font=Fonts.SMALL_BOLD, borderwidth=0)
+            padding=[8, 4], font=Fonts.SMALL_BOLD, borderwidth=0)
         style.map("Settings.TNotebook.Tab",
             background=[("selected", Colors.BG_MEDIUM)],
             foreground=[("selected", Colors.ACCENT_BLUE)])
@@ -66,7 +66,7 @@ class SettingsDialog(tk.Toplevel):
 
         # ─── Connection Tab ──────────────────────────
         conn = tk.Frame(nb, bg=Colors.BG_MEDIUM)
-        nb.add(conn, text="  Connection  ")
+        nb.add(conn, text=" Connection ")
 
         self._add_field(conn, "Listen Port:", "listen_port",
                         self.settings.connection.listen_port, 0, "int")
@@ -85,7 +85,7 @@ class SettingsDialog(tk.Toplevel):
 
         # ─── Speed Tab ───────────────────────────────
         speed = tk.Frame(nb, bg=Colors.BG_MEDIUM)
-        nb.add(speed, text="  Speed  ")
+        nb.add(speed, text=" Speed ")
 
         self._add_field(speed, "DL Limit (KB/s, 0=∞):", "dl_limit",
                         self.settings.speed.download_rate_limit // 1024, 0, "int")
@@ -100,7 +100,7 @@ class SettingsDialog(tk.Toplevel):
 
         # ─── Downloads Tab ───────────────────────────
         dl = tk.Frame(nb, bg=Colors.BG_MEDIUM)
-        nb.add(dl, text="  Downloads  ")
+        nb.add(dl, text=" Downloads ")
 
         row_frame = tk.Frame(dl, bg=Colors.BG_MEDIUM)
         row_frame.pack(fill="x", padx=12, pady=(12, 0))
@@ -129,7 +129,7 @@ class SettingsDialog(tk.Toplevel):
 
         # ─── Topology Tab ───────────────────────────
         topo = tk.Frame(nb, bg=Colors.BG_MEDIUM)
-        nb.add(topo, text="  Topology  ")
+        nb.add(topo, text=" Topology ")
 
         self._add_check(topo, "Enable Topology Engine", "topo_enabled",
                         self.settings.topology.enabled, 0)
@@ -141,12 +141,58 @@ class SettingsDialog(tk.Toplevel):
                         self.settings.topology.uptime_weight, 3, "float")
         self._add_field(topo, "Stability Weight:", "stb_weight",
                         self.settings.topology.stability_weight, 4, "float")
-        self._add_field(topo, "Score Update Interval (s):", "score_interval",
-                        self.settings.topology.score_update_interval_seconds, 5, "float")
+        self._add_field(topo, "Geo Weight:", "geo_weight",
+                        self.settings.topology.geo_weight, 5, "float")
+        self._add_field(topo, "Reputation Weight:", "rep_weight",
+                        self.settings.topology.reputation_weight, 6, "float")
+        self._add_field(topo, "Score Interval (s):", "score_interval",
+                        self.settings.topology.score_update_interval_seconds, 7, "float")
+
+        # ─── Privacy Tab ─────────────────────────────
+        privacy = tk.Frame(nb, bg=Colors.BG_MEDIUM)
+        nb.add(privacy, text=" Privacy ")
+
+        self._add_section_label(privacy, "🛡️ Anti-Throttling & Encryption", 0)
+        self._add_field(privacy, "Encryption Mode:", "enc_mode",
+                        self.settings.privacy.encryption_mode, 1, "int")
+        self._add_section_label(privacy, "  0=Off  1=Enabled  2=Forced", 2, muted=True)
+        self._add_check(privacy, "Traffic Shaping", "traffic_shaping",
+                        self.settings.privacy.traffic_shaping, 3)
+        self._add_check(privacy, "Protocol Obfuscation", "protocol_obfs",
+                        self.settings.privacy.protocol_obfuscation, 4)
+
+        # ─── Advanced Tab ────────────────────────────
+        adv = tk.Frame(nb, bg=Colors.BG_MEDIUM)
+        nb.add(adv, text=" Advanced ")
+
+        self._add_section_label(adv, "📊 Piece Strategy", 0)
+        self._add_field(adv, "Strategy:", "piece_strategy",
+                        self.settings.piece_strategy.strategy, 1)
+        self._add_section_label(adv, "  random / rarest_first / sequential / hybrid", 2, muted=True)
+        self._add_check(adv, "Swarm Intelligence", "swarm_intel",
+                        self.settings.piece_strategy.enable_swarm_intelligence, 3)
+
+        self._add_section_label(adv, "🔄 Auto-Heal", 4)
+        self._add_check(adv, "Enable Auto-Heal", "auto_heal",
+                        self.settings.auto_heal.enabled, 5)
+
+        self._add_section_label(adv, "💾 Edge Cache", 6)
+        self._add_check(adv, "Enable Edge Cache", "edge_cache",
+                        self.settings.edge_cache.enabled, 7)
+        self._add_field(adv, "Memory Cache (MB):", "cache_mem",
+                        self.settings.edge_cache.max_memory_mb, 8, "int")
+
+        self._add_section_label(adv, "🧪 Experimental", 9)
+        self._add_check(adv, "AI Bandwidth Allocation", "ai_bw",
+                        self.settings.experimental.ai_bandwidth, 10)
+        self._add_check(adv, "LAN Mesh Discovery", "lan_mesh",
+                        self.settings.experimental.lan_mesh_discovery, 11)
+        self._add_check(adv, "Multi-Source (HTTP/IPFS)", "multi_src",
+                        self.settings.multi_source.enabled, 12)
 
         # ─── UI Tab ──────────────────────────────────
         ui = tk.Frame(nb, bg=Colors.BG_MEDIUM)
-        nb.add(ui, text="  UI  ")
+        nb.add(ui, text=" UI ")
 
         self._add_check(ui, "Minimize to System Tray", "minimize_tray",
                         self.settings.ui.minimize_to_tray, 0)
@@ -154,6 +200,8 @@ class SettingsDialog(tk.Toplevel):
                         self.settings.ui.show_speed_in_title, 1)
         self._add_check(ui, "Confirm on Delete", "confirm_delete",
                         self.settings.ui.confirm_on_delete, 2)
+        self._add_check(ui, "Show Bottleneck Messages", "show_bottleneck",
+                        self.settings.ui.show_bottleneck_messages, 3)
 
         # ─── Buttons ─────────────────────────────────
         btn_frame = tk.Frame(self, bg=Colors.BG_DARK)
@@ -175,10 +223,10 @@ class SettingsDialog(tk.Toplevel):
 
     def _add_field(self, parent, label, key, default, row, vtype="str"):
         frame = tk.Frame(parent, bg=Colors.BG_MEDIUM)
-        frame.pack(fill="x", padx=12, pady=(8 if row == 0 else 4, 0))
+        frame.pack(fill="x", padx=12, pady=(8 if row == 0 else 3, 0))
 
         tk.Label(
-            frame, text=label, width=22, anchor="w",
+            frame, text=label, width=24, anchor="w",
             bg=Colors.BG_MEDIUM, fg=Colors.TEXT_SECONDARY, font=Fonts.SMALL,
         ).pack(side="left")
 
@@ -201,7 +249,7 @@ class SettingsDialog(tk.Toplevel):
 
     def _add_check(self, parent, label, key, default, row):
         frame = tk.Frame(parent, bg=Colors.BG_MEDIUM)
-        frame.pack(fill="x", padx=12, pady=(8 if row == 0 else 4, 0))
+        frame.pack(fill="x", padx=12, pady=(8 if row == 0 else 3, 0))
 
         var = tk.BooleanVar(value=default)
         self._vars[key] = var
@@ -213,6 +261,16 @@ class SettingsDialog(tk.Toplevel):
             activebackground=Colors.BG_MEDIUM,
             activeforeground=Colors.TEXT_PRIMARY,
             font=Fonts.BODY,
+        ).pack(anchor="w")
+
+    def _add_section_label(self, parent, text, row, muted=False):
+        frame = tk.Frame(parent, bg=Colors.BG_MEDIUM)
+        frame.pack(fill="x", padx=12, pady=(10 if not muted else 0, 0))
+        tk.Label(
+            frame, text=text,
+            bg=Colors.BG_MEDIUM,
+            fg=Colors.TEXT_MUTED if muted else Colors.ACCENT_BLUE,
+            font=Fonts.SMALL if muted else Fonts.SMALL_BOLD,
         ).pack(anchor="w")
 
     def _browse_dir(self, key):
@@ -249,19 +307,37 @@ class SettingsDialog(tk.Toplevel):
             s.topology.throughput_weight = self._vars["thr_weight"].get()
             s.topology.uptime_weight = self._vars["upt_weight"].get()
             s.topology.stability_weight = self._vars["stb_weight"].get()
+            s.topology.geo_weight = self._vars["geo_weight"].get()
+            s.topology.reputation_weight = self._vars["rep_weight"].get()
             s.topology.score_update_interval_seconds = self._vars["score_interval"].get()
+
+            # Privacy
+            s.privacy.encryption_mode = self._vars["enc_mode"].get()
+            s.privacy.traffic_shaping = self._vars["traffic_shaping"].get()
+            s.privacy.protocol_obfuscation = self._vars["protocol_obfs"].get()
+
+            # Advanced
+            s.piece_strategy.strategy = self._vars["piece_strategy"].get()
+            s.piece_strategy.enable_swarm_intelligence = self._vars["swarm_intel"].get()
+            s.auto_heal.enabled = self._vars["auto_heal"].get()
+            s.edge_cache.enabled = self._vars["edge_cache"].get()
+            s.edge_cache.max_memory_mb = self._vars["cache_mem"].get()
+            s.experimental.ai_bandwidth = self._vars["ai_bw"].get()
+            s.experimental.lan_mesh_discovery = self._vars["lan_mesh"].get()
+            s.multi_source.enabled = self._vars["multi_src"].get()
 
             # UI
             s.ui.minimize_to_tray = self._vars["minimize_tray"].get()
             s.ui.show_speed_in_title = self._vars["speed_title"].get()
             s.ui.confirm_on_delete = self._vars["confirm_delete"].get()
+            s.ui.show_bottleneck_messages = self._vars["show_bottleneck"].get()
 
             s.save()
             self.result = s
             self.destroy()
 
         except Exception as e:
-            tk.messagebox.showerror("Error", f"Invalid settings: {e}", parent=self)
+            messagebox.showerror("Error", f"Invalid settings: {e}", parent=self)
 
     def _on_cancel(self):
         self.result = None

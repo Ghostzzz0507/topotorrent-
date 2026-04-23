@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+
+# TopoTorrent data
+*.json
+!requirements.txt
+edge_cache/
+peer_reputation.json
+
+# OS files
+Thumbs.db
+.DS_Store

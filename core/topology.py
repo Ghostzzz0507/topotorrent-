@@ -2,15 +2,18 @@
 Topology-aware peer scoring engine for TopoTorrent.
 
 Monitors connected peers via libtorrent's peer info API and computes
-weighted scores based on latency, throughput, uptime, and connection
-stability. High-scoring peers are favored for data transfer via
-libtorrent's peer upload/download limit APIs.
+weighted scores based on latency, throughput, uptime, connection
+stability, geographic proximity, and reputation.
 """
 
 import time
 import threading
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
+
+# Lazy imports to avoid circular dependencies
+_geo_selector = None
+_reputation_mgr = None
 
 
 @dataclass
@@ -80,10 +83,12 @@ class TopologyConfig:
     score_update_interval: float = 2.0
 
     # Weights (must sum to 1.0)
-    latency_weight: float = 0.35
-    throughput_weight: float = 0.35
-    uptime_weight: float = 0.15
-    stability_weight: float = 0.15
+    latency_weight: float = 0.30
+    throughput_weight: float = 0.30
+    uptime_weight: float = 0.10
+    stability_weight: float = 0.10
+    geo_weight: float = 0.10
+    reputation_weight: float = 0.10
 
     # Normalization
     max_latency_ms: float = 1000.0
@@ -121,6 +126,16 @@ class TopologyEngine:
         self._thread: Optional[threading.Thread] = None
         self._score_callbacks: List[Callable] = []
         self._get_peer_data_callback: Optional[Callable] = None
+        self._geo_selector = None  # Set externally
+        self._reputation_mgr = None  # Set externally
+
+    def set_geo_selector(self, geo_selector):
+        """Set the GeoPeerSelector for geo-aware scoring."""
+        self._geo_selector = geo_selector
+
+    def set_reputation_manager(self, reputation_mgr):
+        """Set the ReputationManager for reputation-aware scoring."""
+        self._reputation_mgr = reputation_mgr
 
     def start(self):
         """Start the background scoring thread."""
@@ -338,8 +353,8 @@ class TopologyEngine:
         """
         Calculate topology score for a peer.
 
-        Score = latency_score * 0.35 + throughput_score * 0.35
-              + uptime_score * 0.15 + stability_score * 0.15
+        Score = latency * w1 + throughput * w2 + uptime * w3
+              + stability * w4 + geo * w5 + reputation * w6
         """
         cfg = self.config
 
@@ -364,12 +379,30 @@ class TopologyEngine:
         if peer.consecutive_failures > 0:
             stability_score *= 1.0 / (1 + peer.consecutive_failures)
 
+        # Geo score (from GeoPeerSelector)
+        geo_score = 0.5  # Default neutral
+        if self._geo_selector:
+            try:
+                geo_score = self._geo_selector.compute_geo_score(peer.ip, peer.port)
+            except Exception:
+                pass
+
+        # Reputation score (from ReputationManager)
+        reputation_score = 0.5  # Default neutral
+        if self._reputation_mgr:
+            try:
+                reputation_score = self._reputation_mgr.get_score(peer.ip, peer.port)
+            except Exception:
+                pass
+
         # Weighted combination
         score = (
             latency_score * cfg.latency_weight
             + throughput_score * cfg.throughput_weight
             + uptime_score * cfg.uptime_weight
             + stability_score * cfg.stability_weight
+            + geo_score * cfg.geo_weight
+            + reputation_score * cfg.reputation_weight
         )
 
         return round(score, 4)

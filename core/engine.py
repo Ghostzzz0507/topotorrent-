@@ -4,6 +4,14 @@ Core engine for TopoTorrent.
 Automatically selects between:
 1. libtorrent-based engine (production-grade, if available)
 2. Pure-Python engine (fallback, no C++ dependencies needed)
+
+Integrates all subsystems:
+- Topology scoring with geo + reputation
+- Privacy / encryption
+- Edge cache
+- Auto-heal
+- LAN mesh discovery
+- Reputation persistence
 """
 
 import os
@@ -18,6 +26,42 @@ from core.pure_engine import (
     generate_peer_id, PurePythonTorrentHandle,
 )
 
+# Optional subsystems (graceful fallback)
+try:
+    from core.geo_peer import GeoPeerSelector
+except ImportError:
+    GeoPeerSelector = None
+
+try:
+    from core.reputation import ReputationManager
+except ImportError:
+    ReputationManager = None
+
+try:
+    from core.edge_cache import EdgeCache
+except ImportError:
+    EdgeCache = None
+
+try:
+    from core.auto_heal import AutoHealEngine
+except ImportError:
+    AutoHealEngine = None
+
+try:
+    from core.privacy import PrivacyManager
+except ImportError:
+    PrivacyManager = None
+
+try:
+    from core.experimental import LANMeshDiscovery
+except ImportError:
+    LANMeshDiscovery = None
+
+try:
+    from core.bottleneck import BottleneckDetector
+except ImportError:
+    BottleneckDetector = None
+
 # Try libtorrent, but don't fail
 lt = None
 _lt_import_error = None
@@ -31,7 +75,7 @@ HAS_LIBTORRENT = lt is not None
 
 class TorrentEngine:
     """
-    Main torrent engine.
+    Main torrent engine with all subsystems integrated.
 
     Uses libtorrent when available, falls back to pure-Python engine.
     Both backends expose the same interface to the GUI.
@@ -50,7 +94,7 @@ class TorrentEngine:
         self._use_libtorrent = HAS_LIBTORRENT
         self._session = None  # libtorrent session (if available)
 
-        # Topology
+        # === Topology Engine ===
         topo_config = TopologyConfig(
             enabled=settings.topology.enabled,
             score_update_interval=settings.topology.score_update_interval_seconds,
@@ -58,12 +102,93 @@ class TorrentEngine:
             throughput_weight=settings.topology.throughput_weight,
             uptime_weight=settings.topology.uptime_weight,
             stability_weight=settings.topology.stability_weight,
+            geo_weight=getattr(settings.topology, 'geo_weight', 0.10),
+            reputation_weight=getattr(settings.topology, 'reputation_weight', 0.10),
             max_latency_ms=settings.topology.max_latency_ms,
             max_throughput_bps=settings.topology.max_throughput_bps,
             ewma_alpha=settings.topology.rtt_ewma_alpha,
             min_score_threshold=settings.topology.min_score_threshold,
         )
         self.topology = TopologyEngine(config=topo_config)
+
+        # === Geo Peer Selector ===
+        self.geo_selector = None
+        if GeoPeerSelector and getattr(settings, 'geo', None) and settings.geo.enabled:
+            try:
+                self.geo_selector = GeoPeerSelector()
+                self.topology.set_geo_selector(self.geo_selector)
+                print("[TopoTorrent] Geo-aware peer selection: ON")
+            except Exception as e:
+                print(f"[TopoTorrent] Geo selector failed: {e}")
+
+        # === Reputation Manager ===
+        self.reputation = None
+        if ReputationManager and getattr(settings, 'reputation', None) and settings.reputation.enabled:
+            try:
+                self.reputation = ReputationManager()
+                self.topology.set_reputation_manager(self.reputation)
+                print("[TopoTorrent] Peer reputation system: ON")
+            except Exception as e:
+                print(f"[TopoTorrent] Reputation failed: {e}")
+
+        # === Edge Cache ===
+        self.edge_cache = None
+        if EdgeCache and getattr(settings, 'edge_cache', None) and settings.edge_cache.enabled:
+            try:
+                self.edge_cache = EdgeCache(
+                    max_memory_mb=settings.edge_cache.max_memory_mb,
+                    max_disk_mb=settings.edge_cache.max_disk_mb,
+                )
+                print("[TopoTorrent] Edge cache: ON")
+            except Exception as e:
+                print(f"[TopoTorrent] Edge cache failed: {e}")
+
+        # === Auto-Heal Engine ===
+        self.auto_heal = None
+        if AutoHealEngine and getattr(settings, 'auto_heal', None) and settings.auto_heal.enabled:
+            try:
+                self.auto_heal = AutoHealEngine()
+                self.auto_heal.on("on_reannounce", self._on_auto_reannounce)
+                self.auto_heal.on("on_reset_pieces", self._on_auto_reset_pieces)
+                print("[TopoTorrent] Auto-heal: ON")
+            except Exception as e:
+                print(f"[TopoTorrent] Auto-heal failed: {e}")
+
+        # === Privacy Manager ===
+        self.privacy = None
+        if PrivacyManager:
+            try:
+                enc_mode = getattr(settings, 'privacy', None)
+                enc_val = enc_mode.encryption_mode if enc_mode else settings.connection.encryption_mode
+                traffic_shaping = enc_mode.traffic_shaping if enc_mode else True
+                self.privacy = PrivacyManager(
+                    encryption_mode=enc_val,
+                    traffic_shaping=traffic_shaping,
+                )
+                print(f"[TopoTorrent] Privacy (encryption={enc_val}): ON")
+            except Exception as e:
+                print(f"[TopoTorrent] Privacy failed: {e}")
+
+        # === LAN Mesh Discovery ===
+        self.lan_mesh = None
+        if (LANMeshDiscovery and getattr(settings, 'experimental', None)
+                and settings.experimental.lan_mesh_discovery):
+            try:
+                self.lan_mesh = LANMeshDiscovery(
+                    bt_listen_port=settings.connection.listen_port
+                )
+                self.lan_mesh.set_on_lan_peer(self._on_lan_peer_found)
+                print("[TopoTorrent] LAN mesh discovery: ON")
+            except Exception as e:
+                print(f"[TopoTorrent] LAN mesh failed: {e}")
+
+        # === Bottleneck Detector ===
+        self.bottleneck_detector = None
+        if BottleneckDetector:
+            try:
+                self.bottleneck_detector = BottleneckDetector()
+            except Exception:
+                pass
 
     @property
     def backend_name(self) -> str:
@@ -81,6 +206,14 @@ class TorrentEngine:
         self.topology.set_peer_data_callback(self._get_all_peer_data)
         self.topology.start()
 
+        # Start auto-heal
+        if self.auto_heal:
+            self.auto_heal.start()
+
+        # Start LAN mesh discovery
+        if self.lan_mesh:
+            self.lan_mesh.start()
+
         # Start polling thread
         self._running = True
         self._poll_thread = threading.Thread(
@@ -92,6 +225,18 @@ class TorrentEngine:
         """Stop the engine and cleanup."""
         self._running = False
         self.topology.stop()
+
+        if self.auto_heal:
+            self.auto_heal.stop()
+
+        if self.lan_mesh:
+            self.lan_mesh.stop()
+
+        if self.reputation:
+            self.reputation.stop()
+
+        if self.edge_cache:
+            self.edge_cache.stop()
 
         if self._poll_thread:
             self._poll_thread.join(timeout=5)
@@ -135,11 +280,13 @@ class TorrentEngine:
         with self._lock:
             th = self._torrents.pop(info_hash, None)
 
+        if self.auto_heal:
+            self.auto_heal.unregister_torrent(info_hash)
+
         if th:
             if isinstance(th, PurePythonTorrentHandle):
                 th.stop()
                 if delete_files:
-                    # Delete downloaded files
                     for fpath, _ in th.meta.files:
                         full = os.path.join(th.save_path, fpath)
                         if os.path.exists(full):
@@ -218,12 +365,37 @@ class TorrentEngine:
             except Exception:
                 pass
 
+        # Edge cache stats
+        cache_stats = {}
+        if self.edge_cache:
+            try:
+                cs = self.edge_cache.get_stats()
+                cache_stats = {
+                    "cache_hits": cs.hits,
+                    "cache_misses": cs.misses,
+                    "cache_hit_rate": f"{cs.hit_rate * 100:.1f}%",
+                    "cache_size_mb": f"{cs.cache_size_bytes / 1024 / 1024:.1f}",
+                }
+            except Exception:
+                pass
+
+        # Reputation stats
+        rep_stats = {}
+        if self.reputation:
+            try:
+                rep_stats = self.reputation.get_stats()
+            except Exception:
+                pass
+
         return {
             "download_speed": total_dl,
             "upload_speed": total_ul,
             "dht_nodes": self._get_dht_nodes(),
             "num_torrents": len(self._torrents),
             "backend": self.backend_name,
+            "cache": cache_stats,
+            "reputation": rep_stats,
+            "lan_peers": len(self.lan_mesh.get_lan_peers()) if self.lan_mesh else 0,
         }
 
     def set_download_limit(self, limit: int):
@@ -258,10 +430,24 @@ class TorrentEngine:
             info_hash_hex = meta.info_hash.hex()
 
             handle = PurePythonTorrentHandle(meta, save_path, self._peer_id)
+
+            # Inject shared subsystems
+            handle._reputation_mgr = self.reputation
+            handle._edge_cache = self.edge_cache
+            handle._geo_selector = self.geo_selector
+
             handle.start()
 
             with self._lock:
                 self._torrents[info_hash_hex] = handle
+
+            # Register with auto-heal
+            if self.auto_heal:
+                self.auto_heal.register_torrent(info_hash_hex)
+
+            # Update LAN mesh with our torrents
+            if self.lan_mesh:
+                self.lan_mesh.update_info_hashes(list(self._torrents.keys()))
 
             return info_hash_hex
         except Exception as e:
@@ -274,14 +460,13 @@ class TorrentEngine:
             info_hash, name, trackers = parse_magnet(magnet_uri)
             info_hash_hex = info_hash.hex()
 
-            # Create a minimal TorrentMeta for magnet
             from core.pure_engine import TorrentMeta
             meta = TorrentMeta(
                 info_hash=info_hash,
                 announce=trackers[0] if trackers else "",
                 announce_list=trackers,
                 name=name,
-                total_length=0,  # Unknown until metadata received
+                total_length=0,
                 piece_length=262144,
                 pieces_hashes=[],
                 files=[(name, 0)],
@@ -289,10 +474,22 @@ class TorrentEngine:
 
             handle = PurePythonTorrentHandle(meta, save_path, self._peer_id)
             handle._state = "Downloading Metadata"
+
+            # Inject shared subsystems
+            handle._reputation_mgr = self.reputation
+            handle._edge_cache = self.edge_cache
+            handle._geo_selector = self.geo_selector
+
             handle.start()
 
             with self._lock:
                 self._torrents[info_hash_hex] = handle
+
+            if self.auto_heal:
+                self.auto_heal.register_torrent(info_hash_hex)
+
+            if self.lan_mesh:
+                self.lan_mesh.update_info_hashes(list(self._torrents.keys()))
 
             return info_hash_hex
         except Exception as e:
@@ -304,7 +501,7 @@ class TorrentEngine:
     # ═══════════════════════════════════════════════════════════════════
 
     def _start_libtorrent(self):
-        """Initialize libtorrent session."""
+        """Initialize libtorrent session with encryption support."""
         settings_pack = {
             "user_agent": "TopoTorrent/1.0",
             "listen_interfaces": f"0.0.0.0:{self.settings.connection.listen_port}",
@@ -320,6 +517,12 @@ class TorrentEngine:
             settings_pack["download_rate_limit"] = self.settings.speed.download_rate_limit
         if self.settings.speed.upload_rate_limit > 0:
             settings_pack["upload_rate_limit"] = self.settings.speed.upload_rate_limit
+
+        # === Apply encryption settings (was dead code before!) ===
+        if self.privacy:
+            lt_enc = self.privacy.get_libtorrent_settings()
+            settings_pack.update(lt_enc)
+            print(f"[TopoTorrent] Encryption applied to libtorrent session")
 
         self._session = lt.session(settings_pack)
 
@@ -348,6 +551,10 @@ class TorrentEngine:
 
             with self._lock:
                 self._torrents[info_hash] = TorrentHandle(handle, save_path)
+
+            if self.auto_heal:
+                self.auto_heal.register_torrent(info_hash)
+
             return info_hash
         except Exception as e:
             print(f"Error: {e}")
@@ -364,6 +571,10 @@ class TorrentEngine:
 
             with self._lock:
                 self._torrents[info_hash] = TorrentHandle(handle, save_path)
+
+            if self.auto_heal:
+                self.auto_heal.register_torrent(info_hash)
+
             return info_hash
         except Exception as e:
             print(f"Error: {e}")
@@ -392,6 +603,37 @@ class TorrentEngine:
                 with self._lock:
                     for th in self._torrents.values():
                         th.topology_avg_score = self.topology.get_average_score()
+
+                # Auto-heal: check torrent health
+                if self.auto_heal:
+                    with self._lock:
+                        torrents_snap = dict(self._torrents)
+                    for ih, th in torrents_snap.items():
+                        try:
+                            status = th.get_status()
+                            if not status.get("is_paused") and not status.get("is_seeding"):
+                                # Get swarm health if available
+                                endangered = 0
+                                missing = 0
+                                if (isinstance(th, PurePythonTorrentHandle) and
+                                        th.piece_manager.strategy_engine and
+                                        th.piece_manager.strategy_engine.swarm):
+                                    swarm = th.piece_manager.strategy_engine.swarm
+                                    health = swarm.get_swarm_health()
+                                    endangered = health.get("endangered", 0)
+                                    missing = health.get("unavailable", 0)
+
+                                self.auto_heal.check_health(
+                                    ih,
+                                    progress=status.get("progress", 0),
+                                    num_seeds=status.get("num_seeds", 0),
+                                    num_peers=status.get("num_peers", 0),
+                                    download_speed=status.get("download_speed", 0),
+                                    endangered_pieces=endangered,
+                                    missing_pieces=missing,
+                                )
+                        except Exception:
+                            pass
 
                 # Notify callbacks
                 for cb in self._status_callbacks:
@@ -436,3 +678,47 @@ class TorrentEngine:
             except Exception:
                 pass
         return 0
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Auto-Heal Callbacks
+    # ═══════════════════════════════════════════════════════════════════
+
+    def _on_auto_reannounce(self, info_hash: str):
+        """Called by auto-heal to force re-announce."""
+        with self._lock:
+            th = self._torrents.get(info_hash)
+        if th:
+            try:
+                th.force_reannounce()
+            except Exception:
+                pass
+
+    def _on_auto_reset_pieces(self, info_hash: str):
+        """Called by auto-heal to reset stalled pieces."""
+        with self._lock:
+            th = self._torrents.get(info_hash)
+        if th and isinstance(th, PurePythonTorrentHandle):
+            try:
+                # Clear stalled in-progress pieces
+                now = time.time()
+                stale = [
+                    idx for idx, t in th.piece_manager.in_progress.items()
+                    if now - t > 60
+                ]
+                for idx in stale:
+                    th.piece_manager.in_progress.pop(idx, None)
+                if stale:
+                    print(f"[AutoHeal] Reset {len(stale)} stalled pieces for {info_hash[:8]}")
+            except Exception:
+                pass
+
+    def _on_lan_peer_found(self, ip: str, port: int, matching_hashes: List[str]):
+        """Called when a LAN peer with matching torrents is found."""
+        for ih in matching_hashes:
+            with self._lock:
+                th = self._torrents.get(ih)
+            if th and isinstance(th, PurePythonTorrentHandle):
+                # Add LAN peer with highest priority
+                if (ip, port) not in [(p.ip, p.port) for p in th.all_peers]:
+                    th.discovered_peers.insert(0, (ip, port))
+                    print(f"[LANMesh] Added LAN peer {ip}:{port} for {ih[:8]}")

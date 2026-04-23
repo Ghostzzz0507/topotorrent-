@@ -91,6 +91,7 @@ class DetailPanel(tk.Frame):
             ("Ratio:", "ratio"),
             ("Info Hash:", "info_hash"),
             ("Topology Score:", "topology_score"),
+            ("Health:", "bottleneck"),
         ]
 
         for i, (label_text, key) in enumerate(fields):
@@ -138,7 +139,7 @@ class DetailPanel(tk.Frame):
         )
 
         cols = ("ip", "client", "flags", "progress", "dl_speed", "ul_speed",
-                "downloaded", "uploaded", "topo_score")
+                "downloaded", "uploaded", "topo_score", "reputation")
         self.peers_tree = ttk.Treeview(
             self.peers_frame, columns=cols, show="headings",
             style="Peers.Treeview",
@@ -146,14 +147,15 @@ class DetailPanel(tk.Frame):
 
         headings = {
             "ip": ("IP Address", 130),
-            "client": ("Client", 120),
-            "flags": ("Flags", 70),
-            "progress": ("Progress", 70),
-            "dl_speed": ("↓ Speed", 80),
-            "ul_speed": ("↑ Speed", 80),
-            "downloaded": ("Downloaded", 85),
-            "uploaded": ("Uploaded", 85),
-            "topo_score": ("⚡ Score", 65),
+            "client": ("Client", 110),
+            "flags": ("Flags", 60),
+            "progress": ("Progress", 65),
+            "dl_speed": ("↓ Speed", 75),
+            "ul_speed": ("↑ Speed", 75),
+            "downloaded": ("Downloaded", 80),
+            "uploaded": ("Uploaded", 80),
+            "topo_score": ("⚡ Score", 60),
+            "reputation": ("🏆 Rep", 55),
         }
 
         for col, (text, width) in headings.items():
@@ -280,6 +282,7 @@ class DetailPanel(tk.Frame):
             "ratio": f"{status.get('ratio', 0):.3f}",
             "info_hash": status.get("info_hash", "—"),
             "topology_score": f"{status.get('topology_score', 0):.3f}",
+            "bottleneck": status.get("bottleneck", "") or "✅ Healthy",
         }
 
         for key, value in updates.items():
@@ -293,7 +296,18 @@ class DetailPanel(tk.Frame):
                         fg=get_score_color(score)
                     )
 
-    def update_peers(self, peers: list, topology_scores: dict = None):
+                # Color health/bottleneck
+                if key == "bottleneck":
+                    msg = status.get("bottleneck", "")
+                    if msg and "🔴" in msg:
+                        self._gen_labels[key].configure(fg="#FF4444")
+                    elif msg and ("🟡" in msg or "⚠" in msg):
+                        self._gen_labels[key].configure(fg="#FFAA00")
+                    else:
+                        self._gen_labels[key].configure(fg=Colors.ACCENT_GREEN)
+
+    def update_peers(self, peers: list, topology_scores: dict = None,
+                     reputation_scores: dict = None):
         """Update the Peers tab."""
         self.peers_tree.delete(*self.peers_tree.get_children())
 
@@ -314,6 +328,12 @@ class DetailPanel(tk.Frame):
                 key = f"{ip}:{port}"
                 topo_score = topology_scores.get(key, 0.0)
 
+            # Get reputation score
+            rep_score = 0.5
+            if reputation_scores:
+                key = f"{ip}:{port}"
+                rep_score = reputation_scores.get(key, 0.5)
+
             self.peers_tree.insert("", "end", values=(
                 f"{ip}:{port}",
                 client,
@@ -324,6 +344,7 @@ class DetailPanel(tk.Frame):
                 format_size(total_dl),
                 format_size(total_ul),
                 f"{topo_score:.2f}",
+                f"{rep_score:.2f}",
             ))
 
     def update_files(self, files: list):

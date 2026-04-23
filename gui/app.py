@@ -248,9 +248,16 @@ class TopoTorrentApp:
                 self._dht_label.configure(
                     text=f"DHT: {stats.get('dht_nodes', 0)} nodes"
                 )
-                self._count_label.configure(
-                    text=f"{stats.get('num_torrents', 0)} torrents"
-                )
+
+                # Show cache + LAN stats if available
+                extra_info = [f"{stats.get('num_torrents', 0)} torrents"]
+                cache = stats.get("cache", {})
+                if cache:
+                    extra_info.append(f"Cache: {cache.get('cache_hit_rate', '0%')}")
+                lan = stats.get("lan_peers", 0)
+                if lan > 0:
+                    extra_info.append(f"LAN: {lan}")
+                self._count_label.configure(text="  |  ".join(extra_info))
 
                 # Update title with speed
                 if self.settings.ui.show_speed_in_title:
@@ -272,12 +279,18 @@ class TopoTorrentApp:
                     status = all_status[selected]
                     self.detail_panel.update_general(status)
 
-                    # Update peers with topology scores
+                    # Update peers with topology + reputation scores
                     th = self.engine.get_torrent(selected)
                     if th:
                         peers = th.get_peers()
-                        scores = self.engine.topology.get_scores()
-                        self.detail_panel.update_peers(peers, scores)
+                        topo_scores = self.engine.topology.get_scores()
+                        rep_scores = (
+                            self.engine.reputation.get_all_scores()
+                            if self.engine.reputation else None
+                        )
+                        self.detail_panel.update_peers(
+                            peers, topo_scores, rep_scores
+                        )
                         self.detail_panel.update_files(th.get_files())
                         self.detail_panel.update_trackers(th.get_trackers())
                         self.detail_panel.update_speed(
